@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Единая команда воспроизводимости: сырые .parquet -> nodes_roles.csv,
-# clusters.csv, top_nodes.csv, graph.html (< 5 минут).
+# clusters.csv, top_nodes.csv, graph_export.json, graph.html (< 5 минут).
 #
 # Использование:
 #   ./run.sh                # data/ -> out/
@@ -17,7 +17,9 @@ fi
 source .venv/bin/activate
 pip install -q -r requirements.txt
 
-python3 src/pipeline.py --data "$DATA_DIR" --out "$OUT_DIR"
+PYTHONPATH="src${PYTHONPATH:+:$PYTHONPATH}" python3 -m moneygraph.cli --data "$DATA_DIR" --out "$OUT_DIR"
 
 echo ""
-echo "Готово. Откройте $OUT_DIR/graph.html в браузере (двойной клик, интернет не нужен)."
+echo "Готово. Варианты просмотра результата:"
+echo "  1) Офлайн-схема без сервера: откройте $OUT_DIR/graph.html в браузере (двойной клик, интернет не нужен)."
+echo "  2) Полный дашборд с AI-ассистентом: ./run_server.sh, затем http://localhost:8000"

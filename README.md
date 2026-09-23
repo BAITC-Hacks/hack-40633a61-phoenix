@@ -7,24 +7,82 @@
 
 Схема решения (данные → метрики → роли → интерфейс) — [`docs/solution_diagram.md`](docs/solution_diagram.md).
 
-## Запуск (одна команда)
+## Запуск продукта (одна команда)
 
 ```bash
-./run.sh                     # data/ -> out/
-# или явно:
-./run.sh path/to/data path/to/out
+./run_server.sh
 ```
 
-Скрипт сам создаёт `.venv`, ставит зависимости из `requirements.txt` и
-запускает пайплайн. Ручной запуск:
+Скрипт создаёт `.venv`, ставит Python-зависимости, при необходимости считает
+demo dataset, устанавливает frontend-зависимости, собирает React/Vite и
+запускает FastAPI на <http://127.0.0.1:8000>. FastAPI обслуживает и `/api/*`,
+и `frontend/dist`; секретов во frontend bundle нет.
+
+Для разработки можно раздельно запустить backend и Vite (Vite проксирует
+`/api` на порт 8000):
 
 ```bash
-python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-python src/pipeline.py --data data --out out
+uvicorn backend.app:app --reload --port 8000
+cd frontend && npm ci && npm run dev
 ```
 
-**Время работы: ~2–5 секунд** на предоставленном объёме (лимит по ТЗ — 5 минут).
+Только пересчёт demo dataset: `./run.sh [data_dir] [out_dir]`.
+
+## Загрузка parquet
+
+Раздел **Data** принимает drag/drop или file picker (до 3 файлов, 50 MB и
+500 000 строк на файл). Каждый запуск получает отдельный `analysis_id` и
+пишется в `runs/<analysis_id>/`; demo в `data/` и `out/` не изменяется.
+После валидации UI показывает определённый тип файла, сопоставление колонок,
+preview первых строк, прогресс и результаты, после чего все разделы и граф
+переключаются на новый анализ.
+
+Поддерживаются:
+
+- `nodes.parquet`: `gid` (опционально `depth`, `is_seed`);
+- `edges.parquet`: `src`, `dst`, `sum_kzt` (опционально `n_tx`, `depth`);
+- `transactions.parquet`: `src`, `dst`, `sum_kzt`, `date`, опционально `tx_id`;
+- один универсальный transaction parquet с алиасами
+  `src/source/from`, `dst/target/to`, `amount/sum_kzt/value`,
+  `date/timestamp`, `tx_id/transaction_id/id`. Узлы и рёбра выводятся из него.
+
+«Любой parquet» не означает произвольную неизвестную бизнес-схему: контейнер
+не исполняется, но обязан пройти schema inference, проверки типов, дат,
+идентификаторов, размера и числа строк. Текстовые идентификаторы безопасно
+перенумеровываются с сохранением mapping внутри run. Сигналы консолидации,
+fan-out, pass-through, циклов и temporal bursts/возможного structuring —
+эвристические AML-гипотезы, а не обвинения. Невидимые периоды, внешние
+контрагенты и переводы ниже порога источника снижают полноту и confidence.
+
+API: `POST /api/analyses` (multipart field `files`) возвращает
+`analysis_id`, `status`, schema preview и results. Передайте
+`analysis_id=<id>` в `/api/summary`, `/api/graph`, `/api/nodes`,
+`/api/clusters`, `/api/top` и `/api/ai/*`.
+
+## OpenAI-совместимый ассистент
+
+Скопируйте `.env.example` в `.env` и задайте настоящий `OPENAI_API_KEY`
+(обычно начинается с `sk-...`). URL вида
+`https://platform.openai.com/p/...` — URL проекта, **не API key**. Ключ
+хранится только в `.env` на backend и не попадает в браузер или git.
+Поддержаны `OPENAI_BASE_URL`, `OPENAI_MODEL` и backward-compatible
+`AI_API_KEY`, `AI_API_BASE_URL`, `AI_MODEL`. `GET /api/ai/status` сообщает
+готовность; без ключа `POST /api/ai/ask` возвращает понятный 503.
+
+Ассистент получает только ограниченный grounded context активного анализа.
+System prompt запрещает посторонние темы, выдуманные gid/суммы и обвинения,
+трактует загруженные значения как недоверенные данные (защита от prompt
+injection), ограничивает размер контекста и возвращает source gid citations,
+когда они доступны.
+
+## Проверки
+
+```bash
+.venv/bin/pytest -q
+cd frontend && npm run build
+```
+
+**Время работы demo pipeline: ~2–5 секунд** на предоставленном объёме (лимит по ТЗ — 5 минут).
 На выходе в `out/`:
 
 | Файл | Содержание |

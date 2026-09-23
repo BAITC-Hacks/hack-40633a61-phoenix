@@ -1,6 +1,16 @@
-# Пайплайн + офлайн-визуализация — HackAlem AI, кейс «Граф денег»
+# Пайплайн (src/moneygraph) + офлайн-визуализация — HackAlem AI, кейс «Граф денег»
 pandas>=2.0
 pyarrow>=14.0
 networkx>=3.1
 numpy>=1.24
 pyvis>=0.3.2
+
+# Backend (backend/) — дашборд + AI-ассистент по API
+fastapi>=0.110
+uvicorn[standard]>=0.29
+python-dotenv>=1.0
+httpx>=0.27
+python-multipart>=0.0.9
+
+# Тесты
+pytest>=8.0

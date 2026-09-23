@@ -1,52 +1,38 @@
-#!/usr/bin/env python3
-"""
-Собирает out/graph.html — единый offline-файл со схемой сети:
-направление потоков, цвет = роль, размер = приоритет, обводка = seed,
-поиск по gid, фильтр по роли/кластеру, карточка узла по клику.
+"""Сборка ``out/graph.html`` — офлайн-схема сети (pyvis + инжектированный UI).
 
-vis-network инлайнится в html (cdn_resources='in_line') — интернет для
-просмотра НЕ требуется. Достаточно открыть out/graph.html в браузере.
+vis-network инлайнится в html (``cdn_resources="in_line"``) — интернет для
+просмотра не требуется. Достаточно открыть ``out/graph.html`` в браузере.
+
+Известный исторический баг («после ресайза граф визуально пропадает, видны
+только orphan-узлы») чинится здесь явным пересчётом размера canvas и
+повторным ``fit()`` при изменении размера контейнера — см. ``_inject_ui``,
+блок ``ResizeObserver``.
 """
 
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 
 import networkx as nx
 import pandas as pd
 from pyvis.network import Network
 
-ROLE_COLOR = {
-    "coordinator": "#e63946",
-    "consolidator": "#f4a261",
-    "distributor": "#9b5de5",
-    "transit": "#4895ef",
-    "terminal": "#2a9d8f",
-    "peripheral": "#adb5bd",
-}
-ROLE_LABEL_RU = {
-    "coordinator": "координатор",
-    "consolidator": "консолидатор",
-    "distributor": "распределитель",
-    "transit": "транзит",
-    "terminal": "конечный получатель",
-    "peripheral": "периферия",
-}
+from .config import ROLE_COLOR, ROLE_LABEL_RU
 
 
-def _layout(G: nx.DiGraph, orphans: list[int]) -> dict:
-    import math
+def _layout(graph: nx.DiGraph, orphans: list[int]) -> dict[int, tuple[float, float]]:
     # spring_layout считаем ТОЛЬКО на подграфе без орфанов (изолированные точки
     # без единого ребра могут внести дублирующиеся начальные координаты в
     # силовой алгоритм и испортить сходимость для всего графа) — орфаны кладём
     # на отдельную полосу ниже.
-    core = G.copy()
+    core = graph.copy()
     core.remove_nodes_from(orphans)
-    UG = core.to_undirected()
-    raw = nx.spring_layout(UG, k=1.6 / max(len(UG) ** 0.5, 1), iterations=150, seed=42)
+    ug = core.to_undirected()
+    raw = nx.spring_layout(ug, k=1.6 / max(len(ug) ** 0.5, 1), iterations=150, seed=42)
 
-    pos = {}
+    pos: dict[int, tuple[float, float]] = {}
     for n, (x, y) in raw.items():
         if not (math.isfinite(x) and math.isfinite(y)):
             x, y = 0.0, 0.0  # защита от редкой численной нестабильности FR-алгоритма
@@ -59,24 +45,25 @@ def _layout(G: nx.DiGraph, orphans: list[int]) -> dict:
 
 
 def build(df: pd.DataFrame, edges: pd.DataFrame, clusters: pd.DataFrame, out_dir: Path) -> None:
-    G = nx.DiGraph()
+    """Строит и записывает ``out_dir/graph.html``."""
+    graph = nx.DiGraph()
     for r in edges.itertuples(index=False):
-        G.add_edge(int(r.src), int(r.dst), sum_kzt=float(r.sum_kzt), n_tx=int(r.n_tx))
+        graph.add_edge(int(r.src), int(r.dst), sum_kzt=float(r.sum_kzt), n_tx=int(r.n_tx))
 
     all_gids = set(df.gid.astype(int))
-    graph_gids = set(G.nodes())
+    graph_gids = set(graph.nodes())
     orphans = sorted(all_gids - graph_gids)
     for gid in orphans:
-        G.add_node(gid)
+        graph.add_node(gid)
 
-    pos = _layout(G, orphans)
+    pos = _layout(graph, orphans)
 
     net = Network(height="100vh", width="100%", directed=True,
                   bgcolor="#0f1115", font_color="#e6e6e6", cdn_resources="in_line")
     net.toggle_physics(False)
 
     attrs = df.set_index("gid").to_dict(orient="index")
-    for gid in G.nodes():
+    for gid in graph.nodes():
         a = attrs.get(gid, {})
         role = a.get("role", "peripheral")
         is_seed = bool(a.get("is_seed", False))
@@ -109,19 +96,18 @@ def build(df: pd.DataFrame, edges: pd.DataFrame, clusters: pd.DataFrame, out_dir
             in_kzt=float(a.get("in_kzt", 0.0)), out_kzt=float(a.get("out_kzt", 0.0)),
         )
 
-    for u, v, d in G.edges(data=True):
+    for u, v, d in graph.edges(data=True):
         w = d.get("sum_kzt", 0.0)
-        import math
         width = 0.6 + math.log10(max(w, 1)) * 0.5
         net.add_edge(u, v, value=w, width=width, color="#4a4f5a",
-                      title=f"{w:,.0f} KZT, {d.get('n_tx', 1)} перев.", arrows="to")
+                     title=f"{w:,.0f} KZT, {d.get('n_tx', 1)} перев.", arrows="to")
 
     net.set_options(json.dumps({
         "nodes": {"font": {"color": "#e6e6e6", "size": 10}},
         "edges": {"smooth": {"enabled": True, "type": "dynamic"},
-                   "arrows": {"to": {"enabled": True, "scaleFactor": 0.5}}},
+                  "arrows": {"to": {"enabled": True, "scaleFactor": 0.5}}},
         "interaction": {"hover": True, "tooltipDelay": 80, "navigationButtons": True,
-                          "keyboard": True},
+                         "keyboard": True},
         "physics": {"enabled": False},
     }))
 
@@ -130,7 +116,7 @@ def build(df: pd.DataFrame, edges: pd.DataFrame, clusters: pd.DataFrame, out_dir
 
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "graph.html").write_text(html, encoding="utf-8")
-    print(f"  graph.html        : офлайн-схема сети ({G.number_of_nodes()} узлов)")
+    print(f"  graph.html        : офлайн-схема сети ({graph.number_of_nodes()} узлов)")
 
 
 def _inject_ui(html: str, df: pd.DataFrame, clusters: pd.DataFrame) -> str:
@@ -192,7 +178,7 @@ def _inject_ui(html: str, df: pd.DataFrame, clusters: pd.DataFrame) -> str:
   #ui-panel input[type=text] {{ width: 100%; box-sizing: border-box; padding: 6px 8px; border-radius: 6px;
     border: 1px solid #363a45; background: #0f1115; color: #e6e6e6; margin-bottom: 6px; }}
   #ui-panel button {{ width: 100%; padding: 6px 8px; border-radius: 6px; border: none;
-    background: #4895ef; color: white; cursor: pointer; }}
+    background: #2effc0; color: #0b0e13; font-weight: 600; cursor: pointer; }}
   #ui-panel .search-row {{ display:flex; flex-direction: column; gap:4px; }}
   #ui-panel .legend-row {{ display:flex; align-items:center; gap:8px; font-size: 13px; padding: 3px 0; }}
   #ui-panel .legend-row .swatch {{ width: 12px; height:12px; border-radius:50%; display:inline-block; }}
@@ -200,7 +186,8 @@ def _inject_ui(html: str, df: pd.DataFrame, clusters: pd.DataFrame) -> str:
   #ui-panel .msg {{ font-size: 12px; color: #f4a261; min-height: 14px; }}
   #nodeInfo {{ font-size: 12px; line-height: 1.5; white-space: pre-wrap; background:#0f1115;
     padding:8px; border-radius:6px; border:1px solid #363a45; }}
-  #mynetwork {{ margin-left: 300px !important; width: calc(100% - 300px) !important;
+  #mynetwork {{ position: fixed !important; top: 0; left: 300px !important;
+    width: calc(100% - 300px) !important; height: 100vh !important;
     border: none !important; }}
   .card {{ border: none !important; background: #0f1115 !important; }}
 </style>
@@ -219,7 +206,11 @@ window.addEventListener('load', function () {{
 }});
 
 function initUI() {{
-  network.fit({{ animation: false }});
+  // Первичный fit — на следующий кадр, чтобы canvas успел получить
+  // реальные размеры контейнера (после того как #ui-panel сдвинул layout).
+  requestAnimationFrame(function () {{
+    resizeNetwork();
+  }});
 
   network.on('click', function (params) {{
     if (params.nodes.length > 0) {{
@@ -243,6 +234,35 @@ function initUI() {{
   document.getElementById('gidSearch').addEventListener('keydown', function (e) {{
     if (e.key === 'Enter') doSearch();
   }});
+
+  // --- Фикс известного бага: после ресайза контейнера канвас vis-network
+  // мог остаться со старым transform (масштаб/сдвиг), из-за чего был виден
+  // только небольшой угол схемы (например, орфан-узлы в правом нижнем углу).
+  // Явно пересчитываем размер канваса и делаем fit() при каждом ресайзе
+  // контейнера/окна, с небольшим дебаунсом.
+  var resizeTimer = null;
+  function scheduleResize() {{
+    if (resizeTimer) clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(resizeNetwork, 120);
+  }}
+  window.addEventListener('resize', scheduleResize);
+  var container = document.getElementById('mynetwork');
+  if (window.ResizeObserver && container) {{
+    new ResizeObserver(scheduleResize).observe(container);
+  }}
+}}
+
+function resizeNetwork() {{
+  var container = document.getElementById('mynetwork');
+  if (!container) return;
+  var w = container.clientWidth;
+  var h = container.clientHeight || window.innerHeight;
+  // setSize + redraw форсируют canvas.width/height (пиксельный буфер) в
+  // соответствие с CSS-размером контейнера — без этого шага vis-network
+  // иногда рисует по устаревшему pixelRatio/transform после ресайза.
+  network.setSize(w + 'px', h + 'px');
+  network.redraw();
+  network.fit({{ animation: false }});
 }}
 
 function showNodeInfo(gid) {{

@@ -1,0 +1,7 @@
+node_modules
+.DS_Store
+*.local
+*.tsbuildinfo
+# frontend/dist умышленно НЕ игнорируется — прод-бандл коммитится в git,
+# чтобы `./run_server.sh` работал без Node.js/npm на машине жюри
+# (см. README.md, раздел «Фронтенд»).
