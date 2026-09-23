@@ -1,4 +1,27 @@
-# Граф денег — восстановление финансовой структуры организованной группы
+# Money Graph
+
+**Локальная AML-платформа для анализа транзакционных сетей из Parquet-файлов.**
+
+[![Python](https://img.shields.io/badge/Python-3.11%2B-3776AB)](https://www.python.org/)
+[![FastAPI](https://img.shields.io/badge/FastAPI-2.0-009688)](https://fastapi.tiangolo.com/)
+[![React](https://img.shields.io/badge/React-18-61DAFB)](https://react.dev/)
+[![Tests](https://img.shields.io/badge/tests-8%20passed-2ea44f)](#проверки)
+
+Money Graph принимает `nodes.parquet`, `edges.parquet` и
+`transactions.parquet`, строит направленный денежный граф и формирует
+объяснимые AML-гипотезы. Все вычисления выполняются локально; OpenAI нужен
+только для опционального ассистента.
+
+## Возможности
+
+- интерактивный force-directed граф реальных переводов;
+- AML-risk 0–100 для узлов, связей, транзакций и кластеров;
+- обнаружение консолидации, fan-out, транзита, циклов и временных всплесков;
+- поиск по исходному ID и раскрытие окрестности или кластера;
+- карточки узлов с факторами риска и связанными транзакциями;
+- изолированные анализы без demo fallback и смешивания наборов;
+- интерфейс на русском и казахском;
+- grounded AI-ассистент, ограниченный активным анализом.
 
 Кейс HackAlem AI. Рабочее пространство AML-аналитика строит граф только по
 активному пользовательскому набору `nodes + edges + transactions`, присваивает
@@ -60,6 +83,32 @@ API: `POST /api/analyses` (multipart fields `nodes`, `edges`, `transactions`) в
 `analysis_id=<id>` в `/api/summary`, `/api/graph`, `/api/nodes`,
 `/api/clusters`, `/api/top` и `/api/ai/*`. Без него аналитические endpoints
 отказываются работать, поэтому данные из `out/` не могут стать fallback.
+
+## Поток данных
+
+```mermaid
+flowchart LR
+    Upload["3 Parquet-файла"] --> Validate["Schema inference и validation"]
+    Validate --> Normalize["Нормализация ID и транзакций"]
+    Normalize --> Graph["Направленный денежный граф"]
+    Graph --> Features["Graph + temporal features"]
+    Features --> Roles["Роли и AML-risk"]
+    Roles --> Clusters["Louvain-кластеры"]
+    Clusters --> API["FastAPI active analysis"]
+    API --> UI["React + Cytoscape"]
+    API --> AI["Grounded AI assistant"]
+```
+
+Основные API:
+
+- `POST /api/analyses` — загрузить и проанализировать три файла;
+- `GET /api/analyses/{analysis_id}` — статус и метаданные анализа;
+- `DELETE /api/analyses/{analysis_id}` — удалить анализ;
+- `GET /api/summary` — сводные показатели;
+- `GET /api/graph` — полный граф, кластерный обзор или окрестность узла;
+- `GET /api/nodes/{gid}` — карточка узла и транзакции;
+- `GET /api/clusters`, `GET /api/top` — кластеры и приоритеты;
+- `GET /api/ai/status`, `POST /api/ai/ask` — AI-ассистент.
 
 ## Интерфейс и масштабирование графа
 
@@ -148,7 +197,7 @@ cd frontend && npm run build
 хранится `n_tx`. Кластеризация — на **неориентированной проекции** (это
 явно оговорено, направление там не имеет смысла — см. ловушку №4 ниже).
 
-### 2. Признаки (`src/pipeline.py::structural_features`)
+### 2. Признаки (`src/moneygraph/features.py`)
 
 | Признак | Смысл |
 |---|---|
@@ -164,7 +213,7 @@ cd frontend && npm run build
 ### 3. Критерии ролей — явные правила с порогами
 
 Пороги подобраны по распределению признаков в данных (см. `TH` в
-`src/pipeline.py`), не «на глаз» и не под конкретные gid:
+`src/moneygraph/config.py`), не «на глаз» и не под конкретные gid:
 
 | Роль | Правило | Обоснование порога |
 |---|---|---|
@@ -269,8 +318,9 @@ consolidator       8    (in_deg 8–13, все — не обрубленные, 
   этому инструменту; это явный пробел, зафиксированный в `analysis_notes.md`.
 - **Louvain недетерминирован в общем случае** между запусками разных версий
   библиотек — зафиксирован `seed=42` для воспроизводимости в рамках среды.
-- **Circular imports / единый скрипт**: `src/build_viewer.py` вызывается
-  из `src/pipeline.py` — оба должны лежать в одной папке (см. `src/`).
+- **NetworkX in-memory** подходит для хакатонного объёма, но для графов на
+  миллионы узлов потребуется распределённый графовый движок и приближённые
+  центральности.
 
 ## Explainability и приватность
 
@@ -315,23 +365,34 @@ Louvain на всём графе) упирается в память и врем
 
 ```
 Hackalem/
-├── data/                    # исходные .parquet (edges, nodes, transactions)
-├── src/
-│   ├── pipeline.py          # весь пайплайн: загрузка -> признаки -> роли -> кластеры -> приоритет -> выгрузки
-│   └── build_viewer.py      # сборка offline out/graph.html (pyvis + custom UI)
-├── out/                     # результат запуска (генерируется)
-├── docs/
-│   └── solution_diagram.md  # схема решения (данные -> метрики -> роли -> интерфейс)
+├── backend/                 # FastAPI, upload API, active runs, AI assistant
+│   ├── routers/             # analyses, graph, nodes, clusters, AI
+│   ├── upload_service.py    # schema inference и строгая валидация
+│   └── data_store.py        # изолированное чтение analysis_id
+├── frontend/                # React + TypeScript + Cytoscape
+│   └── src/                 # Overview, граф, RU/KK, API client
+├── src/moneygraph/          # аналитический Python-пакет
+│   ├── pipeline.py          # оркестрация полного расчёта
+│   ├── features.py          # графовые и временные признаки
+│   ├── roles.py             # объяснимые роли
+│   ├── risk.py              # AML-risk узлов/рёбер/кластеров
+│   └── exports.py           # CSV, JSON, enriched parquet
+├── data/                    # локальный контрольный набор
+├── runs/                    # пользовательские анализы (gitignored)
+├── out/                     # CLI-результат (генерируется)
+├── tests/                   # API и pipeline smoke-тесты
+├── docs/solution_diagram.md
 ├── requirements.txt
-├── run.sh                   # единая команда запуска
+├── run.sh                   # CLI-пересчёт
+├── run_server.sh            # сборка frontend + запуск продукта
 └── README.md
 ```
 
-## Демо (2–3 узла для разбора)
+## Сценарий демонстрации
 
-Открыть `out/graph.html`, ввести gid из `out/top_nodes.csv` (первые строки —
-`coordinator`/`consolidator`), показать evidence в карточке узла, снять
-галочку `terminal` в легенде, чтобы обнажить структуру ключевых узлов.
-Для узла на 4-м колене без исходящих — показать `truncated_by_depth=True`
-в `nodes_roles.csv` и пониженный `role_score` как иллюстрацию честной
-неопределённости.
+1. Запустить `./run_server.sh` и открыть <http://127.0.0.1:8000>.
+2. Выбрать три Parquet-файла и нажать **АНАЛИЗИРОВАТЬ**.
+3. Раскрыть кластер или найти узел по исходному ID.
+4. Показать risk score, факторы, соседей и реальные транзакции в карточке.
+5. Переключить язык на **Қазақша**.
+6. Удалить анализ кнопкой `×` и загрузить другой набор.
