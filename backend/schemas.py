@@ -44,6 +44,8 @@ class NodeListItem(BaseModel):
     out_deg: int
     in_kzt: float
     out_kzt: float
+    risk_score: float
+    risk_level: str
 
 
 class NodeListResponse(BaseModel):
@@ -59,6 +61,21 @@ class NeighborEdge(BaseModel):
     sum_kzt: float
     n_tx: int
     direction: str  # "in" | "out"
+    risk_score: float
+    risk_level: str
+    has_transactions: bool = True
+
+
+class TransactionOut(BaseModel):
+    tx_id: str
+    source: str
+    target: str
+    sum_kzt: float
+    date: str
+    risk_score: float
+    risk_level: str
+    risk_factors: str
+    details: dict[str, Any] = Field(default_factory=dict)
 
 
 class NodeDetail(BaseModel):
@@ -68,6 +85,10 @@ class NodeDetail(BaseModel):
     cluster_id: int
     priority_score: float
     evidence: str
+    risk_score: float
+    risk_level: str
+    risk_factors: str
+    risk_explanation: str
     is_seed: bool
     depth: int
     in_deg: int
@@ -85,7 +106,9 @@ class NodeDetail(BaseModel):
     max_same_day_payers: int | None = None
     fast_transit: bool | None = None
     synchronized_burst: bool | None = None
+    attributes: dict[str, Any] = Field(default_factory=dict)
     neighbors: list[NeighborEdge] = Field(default_factory=list)
+    transactions: list[TransactionOut] = Field(default_factory=list)
 
 
 class ClusterOut(BaseModel):
@@ -95,6 +118,10 @@ class ClusterOut(BaseModel):
     sum_kzt_internal: float
     top_gids: list[str]  # см. комментарий у NodeListItem.gid — точность int64 в JSON
     hypothesis: str
+    risk_score: float
+    risk_level: str
+    risk_factors: str
+    risk_explanation: str
 
 
 class TopNodeOut(BaseModel):
@@ -102,6 +129,8 @@ class TopNodeOut(BaseModel):
     gid: str  # см. комментарий у NodeListItem.gid — точность int64 в JSON
     role: str
     priority_score: float
+    risk_score: float
+    risk_level: str
     why: str
 
 
@@ -117,23 +146,47 @@ class GraphNode(BaseModel):
     out_deg: int
     in_kzt: float
     out_kzt: float
+    in_tx: int = 0
+    out_tx: int = 0
+    risk_score: float
+    risk_level: str
+    risk_factors: str
+    risk_explanation: str
+    kind: str = "entity"
+    label: str | None = None
+    member_count: int = 1
 
 
 class GraphEdge(BaseModel):
+    id: str
     source: str  # см. комментарий у NodeListItem.gid — точность int64 в JSON
     target: str
     sum_kzt: float
     n_tx: int
+    has_transactions: bool = True
+    tx_ids: list[str] = Field(default_factory=list)
+    first_date: str | None = None
+    last_date: str | None = None
+    risk_score: float
+    risk_level: str
+    risk_factors: str
+    risk_explanation: str
 
 
 class GraphResponse(BaseModel):
     nodes: list[GraphNode]
     edges: list[GraphEdge]
     truncated: bool = Field(description="True, если выдача обрезана лимитом")
+    view: str = "full"
+    total_nodes: int = 0
+    aggregated: bool = False
 
 
 class AIAskRequest(BaseModel):
     question: str = Field(min_length=1, max_length=2000)
+    language: str = Field(default="ru", pattern="^(ru|kk)$")
+    selected_gid: str | None = None
+    cluster_id: int | None = None
 
 
 class AICitation(BaseModel):

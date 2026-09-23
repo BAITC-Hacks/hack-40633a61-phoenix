@@ -7,6 +7,7 @@ import re
 import shutil
 import uuid
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -18,15 +19,15 @@ from src.moneygraph.pipeline import run
 
 MAX_UPLOAD_BYTES = 50 * 1024 * 1024
 MAX_ROWS = 500_000
-MAX_FILES = 3
+REQUIRED_KINDS = ("nodes", "edges", "transactions")
 
 ALIASES = {
-    "src": ("src", "source", "from"),
-    "dst": ("dst", "target", "to"),
+    "src": ("src", "source", "from", "sender", "sender_id"),
+    "dst": ("dst", "target", "to", "receiver", "receiver_id"),
     "sum_kzt": ("sum_kzt", "amount", "value"),
     "date": ("date", "timestamp"),
     "tx_id": ("tx_id", "transaction_id", "transaction id", "id"),
-    "gid": ("gid", "node_id", "account_id"),
+    "gid": ("gid", "node_id", "account_id", "entity_id", "id"),
     "is_seed": ("is_seed", "seed"),
     "depth": ("depth", "level", "hop"),
     "n_tx": ("n_tx", "transaction_count", "count"),
@@ -61,11 +62,9 @@ def _column_map(columns: list[str]) -> dict[str, str]:
     result: dict[str, str] = {}
     for canonical, aliases in ALIASES.items():
         matches = [by_lower[alias] for alias in aliases if alias in by_lower]
-        if len(matches) > 1:
-            raise UploadValidationError(
-                f"Ambiguous columns for {canonical}: {', '.join(matches)}. Keep only one supported alias."
-            )
         if matches:
+            # Alias order is deliberate: canonical names win over generic
+            # alternatives such as ``id``.
             result[canonical] = matches[0]
     return result
 
@@ -95,13 +94,18 @@ def _json_value(value: Any) -> Any:
     return str(value) if not isinstance(value, (str, int, float, bool)) else value
 
 
-async def save_and_inspect(files: list[UploadFile], incoming_dir: Path) -> list[IngestedFile]:
-    if not 1 <= len(files) <= MAX_FILES:
-        raise UploadValidationError(f"Upload 1 to {MAX_FILES} parquet files.")
+async def save_and_inspect(
+    files: dict[str, UploadFile],
+    incoming_dir: Path,
+) -> list[IngestedFile]:
+    if set(files) != set(REQUIRED_KINDS):
+        raise UploadValidationError(
+            "Нужно загрузить ровно три файла: nodes, edges и transactions."
+        )
     incoming_dir.mkdir(parents=True, exist_ok=False)
     results: list[IngestedFile] = []
-    kinds: set[str] = set()
-    for index, upload in enumerate(files):
+    for index, expected_kind in enumerate(REQUIRED_KINDS):
+        upload = files[expected_kind]
         name = _safe_name(upload.filename, index)
         path = incoming_dir / f"{index}-{name}"
         size = 0
@@ -125,9 +129,24 @@ async def save_and_inspect(files: list[UploadFile], incoming_dir: Path) -> list[
             raise UploadValidationError(f"{name}: row count must be 1..{MAX_ROWS:,}; got {rows:,}.")
         mapping = _column_map(columns)
         kind = _infer_kind(mapping)
-        if kind in kinds:
-            raise UploadValidationError(f"More than one file inferred as {kind}.")
-        kinds.add(kind)
+        if kind != expected_kind:
+            raise UploadValidationError(
+                f"{name}: файл выбран как {expected_kind}, но его схема распознана как {kind}."
+            )
+        if kind == "nodes":
+            mapping = {key: value for key, value in mapping.items() if key in {"gid", "is_seed", "depth"}}
+        elif kind == "edges":
+            mapping = {
+                key: value
+                for key, value in mapping.items()
+                if key in {"src", "dst", "sum_kzt", "n_tx", "depth"}
+            }
+        else:
+            mapping = {
+                key: value
+                for key, value in mapping.items()
+                if key in {"src", "dst", "sum_kzt", "date", "tx_id"}
+            }
         try:
             sample = pd.read_parquet(path, columns=columns).head(5)
         except Exception as exc:
@@ -154,13 +173,20 @@ def _normalize_amounts(df: pd.DataFrame, label: str) -> None:
         raise UploadValidationError(f"{label}: amount/sum_kzt/value must contain finite non-negative numbers.")
 
 
+def _normalize_identifier_column(df: pd.DataFrame, column: str, label: str) -> None:
+    if df[column].isna().any():
+        raise UploadValidationError(f"{label}: колонка {column} содержит пустые ID.")
+    values = df[column].astype(str).str.strip()
+    if values.eq("").any():
+        raise UploadValidationError(f"{label}: колонка {column} содержит пустые ID.")
+    df[column] = values
+
+
 def _normalize_ids(frames: list[pd.DataFrame]) -> dict[str, int]:
     values: list[str] = []
     for frame in frames:
         for column in ("gid", "src", "dst"):
             if column in frame:
-                if frame[column].isna().any():
-                    raise UploadValidationError(f"{column} contains null identifiers.")
                 values.extend(frame[column].astype(str).tolist())
     unique = sorted(set(values))
     numeric: dict[str, int] = {}
@@ -180,68 +206,98 @@ def _normalize_ids(frames: list[pd.DataFrame]) -> dict[str, int]:
 
 def prepare_dataset(items: list[IngestedFile], data_dir: Path) -> dict[str, Any]:
     by_kind = {item.kind: item for item in items}
-    tx = _rename(_read(by_kind["transactions"]), by_kind["transactions"]) if "transactions" in by_kind else None
-    edges = _rename(_read(by_kind["edges"]), by_kind["edges"]) if "edges" in by_kind else None
-    nodes = _rename(_read(by_kind["nodes"]), by_kind["nodes"]) if "nodes" in by_kind else None
-
-    if tx is None:
+    missing = set(REQUIRED_KINDS) - set(by_kind)
+    if missing:
         raise UploadValidationError(
-            "A transactions parquet is required. It must include src/source/from, "
-            "dst/target/to, amount/sum_kzt/value and date/timestamp."
+            "Отсутствуют обязательные файлы: " + ", ".join(sorted(missing)) + "."
         )
+    tx = _rename(_read(by_kind["transactions"]), by_kind["transactions"])
+    edges = _rename(_read(by_kind["edges"]), by_kind["edges"])
+    nodes = _rename(_read(by_kind["nodes"]), by_kind["nodes"])
+
+    for column in ("src", "dst"):
+        _normalize_identifier_column(tx, column, "transactions")
+        _normalize_identifier_column(edges, column, "edges")
+    _normalize_identifier_column(nodes, "gid", "nodes")
+    if nodes.gid.duplicated().any():
+        duplicates = nodes.loc[nodes.gid.duplicated(keep=False), "gid"].unique()[:10]
+        raise UploadValidationError(
+            "nodes: ID должны быть уникальными. Дубликаты: "
+            + ", ".join(map(str, duplicates))
+            + "."
+        )
+
     _normalize_amounts(tx, "transactions")
     tx["date"] = pd.to_datetime(tx["date"], errors="coerce", utc=True).dt.tz_localize(None)
     if tx["date"].isna().any():
-        raise UploadValidationError("transactions: date/timestamp contains invalid or missing dates.")
+        raise UploadValidationError("transactions: date/timestamp содержит некорректные даты.")
     if "tx_id" not in tx:
         tx["tx_id"] = [f"tx-{i + 1}" for i in range(len(tx))]
-    if tx["tx_id"].isna().any() or tx["tx_id"].astype(str).duplicated().any():
-        raise UploadValidationError("transactions: transaction id must be non-null and unique when provided.")
-
-    if edges is not None:
-        _normalize_amounts(edges, "edges")
-        if "n_tx" not in edges:
-            edges["n_tx"] = 1
-        if "depth" not in edges:
-            edges["depth"] = 1
-        edges["n_tx"] = pd.to_numeric(edges["n_tx"], errors="coerce").fillna(1).astype(int)
-        edges["depth"] = pd.to_numeric(edges["depth"], errors="coerce").fillna(1).astype(int)
-    if nodes is not None:
-        if "is_seed" not in nodes:
-            nodes["is_seed"] = False
-        nodes["is_seed"] = nodes["is_seed"].fillna(False).astype(bool)
-        if "depth" not in nodes:
-            nodes["depth"] = 0
-        nodes["depth"] = pd.to_numeric(nodes["depth"], errors="coerce").fillna(0).astype(int)
-
-    frames = [frame for frame in (tx, edges, nodes) if frame is not None]
-    id_mapping = _normalize_ids(frames)
-    if edges is None:
-        edges = tx.groupby(["src", "dst"], as_index=False).agg(sum_kzt=("sum_kzt", "sum"), n_tx=("sum_kzt", "size"))
-        edges["depth"] = 1
-    if nodes is None:
-        gids = pd.unique(pd.concat([tx["src"], tx["dst"]], ignore_index=True))
-        nodes = pd.DataFrame({"gid": gids, "depth": 0, "is_seed": False})
-
-    known = set(nodes["gid"])
-    referenced = set(tx["src"]) | set(tx["dst"]) | set(edges["src"]) | set(edges["dst"])
-    missing = referenced - known
-    if missing:
-        nodes = pd.concat(
-            [nodes, pd.DataFrame({"gid": sorted(missing), "depth": 0, "is_seed": False})],
-            ignore_index=True,
+    _normalize_identifier_column(tx, "tx_id", "transactions")
+    if tx.tx_id.duplicated().any():
+        duplicates = tx.loc[tx.tx_id.duplicated(keep=False), "tx_id"].unique()[:10]
+        raise UploadValidationError(
+            "transactions: transaction ID должны быть уникальными. Дубликаты: "
+            + ", ".join(map(str, duplicates))
+            + "."
         )
-    nodes = nodes[["gid", "depth", "is_seed"]].drop_duplicates("gid")
-    edges = edges[["src", "dst", "sum_kzt", "n_tx", "depth"]]
-    tx = tx[["tx_id", "src", "dst", "sum_kzt", "date"]]
+
+    _normalize_amounts(edges, "edges")
+    if "n_tx" not in edges:
+        edges["n_tx"] = 0
+    if "depth" not in edges:
+        edges["depth"] = 1
+    edges["n_tx"] = pd.to_numeric(edges["n_tx"], errors="coerce").fillna(0).clip(lower=0).astype(int)
+    edges["depth"] = pd.to_numeric(edges["depth"], errors="coerce").fillna(1).astype(int)
+    if "is_seed" not in nodes:
+        nodes["is_seed"] = False
+    nodes["is_seed"] = nodes["is_seed"].fillna(False).astype(bool)
+    if "depth" not in nodes:
+        nodes["depth"] = 0
+    nodes["depth"] = pd.to_numeric(nodes["depth"], errors="coerce").fillna(0).astype(int)
+
+    known = set(nodes.gid)
+    references = set(tx.src) | set(tx.dst) | set(edges.src) | set(edges.dst)
+    unknown = sorted(references - known)
+    if unknown:
+        sample = ", ".join(unknown[:20])
+        suffix = f" (и ещё {len(unknown) - 20})" if len(unknown) > 20 else ""
+        raise UploadValidationError(
+            "edges/transactions ссылаются на ID, отсутствующие в nodes: "
+            f"{sample}{suffix}. Добавьте их в nodes.parquet и повторите анализ."
+        )
+
+    frames = [tx, edges, nodes]
+    id_mapping = _normalize_ids(frames)
+
+    edge_agg = (
+        edges.groupby(["src", "dst"], as_index=False)
+        .agg(sum_kzt=("sum_kzt", "sum"), n_tx=("n_tx", "sum"), depth=("depth", "min"))
+    )
+    tx_agg = (
+        tx.groupby(["src", "dst"], as_index=False)
+        .agg(tx_sum_kzt=("sum_kzt", "sum"), tx_n_tx=("tx_id", "size"))
+    )
+    reconciled = edge_agg.merge(tx_agg, on=["src", "dst"], how="outer")
+    reconciled["has_transactions"] = reconciled.tx_n_tx.notna()
+    reconciled["sum_kzt"] = reconciled.tx_sum_kzt.fillna(reconciled.sum_kzt)
+    reconciled["n_tx"] = reconciled.tx_n_tx.fillna(reconciled.n_tx).fillna(0).astype(int)
+    reconciled["depth"] = reconciled.depth.fillna(1).astype(int)
+    edges = reconciled[["src", "dst", "sum_kzt", "n_tx", "depth", "has_transactions"]]
 
     data_dir.mkdir(parents=True, exist_ok=False)
     nodes.to_parquet(data_dir / "nodes.parquet", index=False)
     edges.to_parquet(data_dir / "edges.parquet", index=False)
     tx.to_parquet(data_dir / "transactions.parquet", index=False)
     mapped = any(str(value) != str(mapped_value) for value, mapped_value in id_mapping.items())
-    if mapped:
-        (data_dir / "id_mapping.json").write_text(json.dumps(id_mapping, ensure_ascii=False), encoding="utf-8")
+    mapping_payload = {
+        "external_to_internal": id_mapping,
+        "internal_to_external": {str(value): key for key, value in id_mapping.items()},
+    }
+    (data_dir / "id_mapping.json").write_text(
+        json.dumps(mapping_payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
     return {
         "nodes": len(nodes),
         "edges": len(edges),
@@ -252,7 +308,7 @@ def prepare_dataset(items: list[IngestedFile], data_dir: Path) -> dict[str, Any]
     }
 
 
-async def create_analysis(files: list[UploadFile], runs_dir: Path) -> dict[str, Any]:
+async def create_analysis(files: dict[str, UploadFile], runs_dir: Path) -> dict[str, Any]:
     analysis_id = uuid.uuid4().hex
     run_dir = runs_dir / analysis_id
     try:
@@ -265,6 +321,7 @@ async def create_analysis(files: list[UploadFile], runs_dir: Path) -> dict[str, 
         response = {
             "analysis_id": analysis_id,
             "status": "completed",
+            "analyzed_at": datetime.now(timezone.utc).isoformat(),
             "files": [
                 {
                     "name": item.name, "kind": item.kind, "rows": item.rows,

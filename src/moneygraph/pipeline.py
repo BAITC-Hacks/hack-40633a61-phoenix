@@ -17,6 +17,7 @@ from .features import structural_features
 from .graph import build_graph
 from .loading import DataLoadError, load, sanity_check
 from .priority import build_top_nodes, compute_priority
+from .risk import compute_risk, enrich_cluster_risk
 from .roles import assign_roles
 from .temporal import temporal_features
 
@@ -45,10 +46,11 @@ def run(data_dir: Path, out_dir: Path, build_viewer: bool = True) -> pd.DataFram
     df = assign_roles(df)
     df = compute_priority(df)
 
-    clusters = build_clusters_table(df, raw.edges)
+    df, risk_edges, risk_transactions = compute_risk(df, raw.edges, raw.tx)
+    clusters = enrich_cluster_risk(build_clusters_table(df, risk_edges), df)
     top_nodes = build_top_nodes(df, n=40)
 
-    write_outputs(df, clusters, top_nodes, graph, out_dir)
+    write_outputs(df, clusters, top_nodes, risk_edges, risk_transactions, out_dir)
     write_analysis_notes(df, graph, out_dir)
 
     elapsed = time.time() - t_start

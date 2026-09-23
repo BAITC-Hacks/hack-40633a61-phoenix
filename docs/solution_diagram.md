@@ -1,62 +1,53 @@
 # Схема решения
 
-Один слайд: данные → метрики → роли → интерфейс.
-
 ```mermaid
 flowchart LR
-    subgraph IN["Вход (data/*.parquet)"]
-        E["edges.parquet\nsrc→dst, sum_kzt, n_tx, depth"]
-        N["nodes.parquet\ngid, depth, is_seed"]
-        T["transactions.parquet\nsrc, dst, date, sum_kzt"]
+    subgraph INPUT["Строгий вход"]
+        N["nodes.parquet\nID и атрибуты"]
+        E["edges.parquet\nструктурные связи"]
+        T["transactions.parquet\nфактические переводы + tx_id"]
+        V["Schema/type/date validation\nunknown ID → reject"]
+        N --> V
+        E --> V
+        T --> V
     end
 
-    subgraph GRAPH["Граф (NetworkX DiGraph)"]
-        G["2 248 узлов, 3 119 рёбер\nнаправленный, взвешенный по sum_kzt"]
+    subgraph NORMALIZE["Изолированный active run"]
+        I["Сохранение исходных ID\nи дополнительных полей"]
+        U["Агрегация transaction-пар\n+ union edge-only пар"]
+        V --> I --> U
     end
 
-    subgraph METRICS["Метрики (src/pipeline.py)"]
-        M1["Структурные:\nin/out_deg, in/out_kzt,\npagerank, betweenness,\npass_through, циклы,\ncomponent_id"]
-        M2["Временные (transactions):\nмедианная задержка\nприём→отправка,\nсинхронные платежи/день"]
-        M3["Кластеры:\nLouvain на неориентированной\nпроекции (67 сообществ)"]
+    subgraph ANALYTICS["Объяснимая аналитика"]
+        G["Направленный граф\nsum_kzt + n_tx"]
+        M["Структурные и временные метрики\nциклы · pass-through · bursts"]
+        C["Louvain-кластеры"]
+        R["AML risk 0–100\nузел · связь · транзакция · кластер"]
+        U --> G --> M
+        G --> C
+        M --> R
+        C --> R
     end
 
-    subgraph ROLES["Роли (явные правила с порогами)"]
-        R1["coordinator\nin_deg≥8 И out_deg≥10"]
-        R2["consolidator\nin_deg≥8"]
-        R3["distributor\nout_deg≥10"]
-        R4["transit\npass_through∈[0.8,1.2]"]
-        R5["terminal\nout_deg=0"]
-        R6["peripheral\nостальное"]
+    subgraph API["FastAPI — только analysis_id"]
+        A["summary / graph / nodes\nclusters / top / AI"]
+        D["DELETE analysis\nочистка run + cache"]
+        R --> A
     end
 
-    subgraph PRIORITY["Приоритет"]
-        P["priority_score =\n0.35·role_weight + 0.25·pagerank_pct\n+ 0.20·volume_pct + 0.15·betweenness_pct\n+ 0.05·novelty(¬seed)"]
+    subgraph UI["RU/KK рабочее пространство"]
+        W["Upload → force graph → node card"]
+        L["Риск-цвет/размер/толщина\nпоиск · highlight · fit/reset"]
+        B["Большая сеть:\ncluster overview → раскрытие"]
+        X["Backend-only OpenAI\nограниченный active context"]
+        A --> W
+        W --> L
+        W --> B
+        A --> X
+        D --> W
     end
-
-    subgraph OUT["Выход"]
-        O1["nodes_roles.csv (2 248 строк)"]
-        O2["clusters.csv (68 кластеров)"]
-        O3["top_nodes.csv (40 строк)"]
-        O4["graph.html — офлайн-схема:\nроли/кластеры, поиск по gid,\nкарточка узла"]
-    end
-
-    E --> G
-    N --> G
-    T --> M2
-    G --> M1
-    G --> M3
-    M1 --> ROLES
-    ROLES --> P
-    M1 --> P
-    P --> OUT
-    M3 --> O2
-    ROLES --> O1
-    P --> O3
-    O1 --> O4
-    O2 --> O4
 ```
 
-**Аналитик:** получает `data/*.parquet` → запускает `./run.sh` → за секунды получает
-`out/nodes_roles.csv`, `out/clusters.csv`, `out/top_nodes.csv` и открывает
-`out/graph.html`, где ищет любой из 2 248 gid, видит его роль, кластер и
-обоснование, и формирует список на углублённую проверку.
+`transactions.parquet` является источником фактических переводов. Исходные
+ID и детали операций сохраняются, неизвестные ID не подменяются техническими
+или демонстрационными узлами. Все risk-формулировки — AML-гипотезы для проверки.

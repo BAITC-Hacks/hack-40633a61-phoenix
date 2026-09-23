@@ -57,8 +57,12 @@ def load(data_dir: Path) -> RawData:
 
 
 def sanity_check(raw: RawData) -> None:
-    """Печатает сводку по данным и падает с AssertionError, если edges/tx
-    не сходятся по парам (src, dst) — жёсткая проверка консистентности."""
+    """Validate that every real transaction pair is represented by an edge.
+
+    ``edges`` may additionally contain structural links without a transaction
+    in the uploaded period. For transaction-backed pairs, the transaction
+    aggregate is authoritative.
+    """
     edges, nodes, tx = raw.edges, raw.nodes, raw.tx
 
     print("=" * 70)
@@ -72,9 +76,13 @@ def sanity_check(raw: RawData) -> None:
     print(f"  период                : {tx.date.min().date()} — {tx.date.max().date()}")
 
     agg = tx.groupby(["src", "dst"]).agg(s=("sum_kzt", "sum"), c=("sum_kzt", "size")).reset_index()
-    m = edges.merge(agg, on=["src", "dst"], how="outer", indicator=True)
-    assert (m._merge == "both").all(), "edges и transactions не сходятся по парам"
-    print("  edges == transactions : OK")
+    m = edges.merge(agg, on=["src", "dst"], how="right", indicator=True)
+    assert (m._merge == "both").all(), "не все пары transactions представлены в edges"
+    backed = m if "has_transactions" not in m else m[m.has_transactions.fillna(False)]
+    assert ((backed.sum_kzt - backed.s).abs() < 0.01).all(), (
+        "суммы transaction-backed edges должны совпадать с transactions"
+    )
+    print("  transactions ⊆ edges : OK")
 
     in_edges = set(edges.src) | set(edges.dst)
     orphans = set(nodes.gid) - in_edges

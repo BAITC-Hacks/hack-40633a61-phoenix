@@ -42,7 +42,7 @@ export interface ApiSummary {
 
 export interface ApiGraphNode {
   id: string
-  role: Role
+  role: string
   role_score: number
   cluster_id: number
   priority_score: number
@@ -52,19 +52,40 @@ export interface ApiGraphNode {
   out_deg: number
   in_kzt: number
   out_kzt: number
+  in_tx: number | null
+  out_tx: number | null
+  risk_score: number
+  risk_level: 'low' | 'medium' | 'high' | 'critical'
+  risk_factors: string
+  risk_explanation: string
+  kind: 'entity' | 'cluster'
+  label: string | null
+  member_count: number
 }
 
 export interface ApiGraphEdge {
+  id: string
   source: string
   target: string
   sum_kzt: number
   n_tx: number
+  has_transactions: boolean
+  tx_ids: string[]
+  first_date: string | null
+  last_date: string | null
+  risk_score: number
+  risk_level: 'low' | 'medium' | 'high' | 'critical'
+  risk_factors: string
+  risk_explanation: string
 }
 
 export interface ApiGraphResponse {
   nodes: ApiGraphNode[]
   edges: ApiGraphEdge[]
   truncated: boolean
+  view: 'full' | 'clusters'
+  total_nodes: number
+  aggregated: boolean
 }
 
 export interface ApiCluster {
@@ -74,6 +95,10 @@ export interface ApiCluster {
   sum_kzt_internal: number
   top_gids: string[]
   hypothesis: string
+  risk_score: number
+  risk_level: 'low' | 'medium' | 'high' | 'critical'
+  risk_factors: string
+  risk_explanation: string
 }
 
 export interface ApiTopNode {
@@ -81,6 +106,8 @@ export interface ApiTopNode {
   gid: string
   role: Role
   priority_score: number
+  risk_score: number
+  risk_level: 'low' | 'medium' | 'high' | 'critical'
   why: string
 }
 
@@ -90,6 +117,9 @@ export interface ApiNeighborEdge {
   sum_kzt: number
   n_tx: number
   direction: 'in' | 'out'
+  risk_score: number
+  risk_level: string
+  has_transactions: boolean
 }
 
 export interface ApiNodeDetail extends ApiGraphNode {
@@ -106,7 +136,21 @@ export interface ApiNodeDetail extends ApiGraphNode {
   max_same_day_payers: number | null
   fast_transit: boolean | null
   synchronized_burst: boolean | null
+  attributes: Record<string, unknown>
   neighbors: ApiNeighborEdge[]
+  transactions: ApiTransaction[]
+}
+
+export interface ApiTransaction {
+  tx_id: string
+  source: string
+  target: string
+  sum_kzt: number
+  date: string
+  risk_score: number
+  risk_level: 'low' | 'medium' | 'high' | 'critical'
+  risk_factors: string
+  details: Record<string, unknown>
 }
 
 export interface ApiAiStatus {
@@ -130,6 +174,7 @@ export interface ApiAiAskResponse {
 export interface AnalysisResponse {
   analysis_id: string
   status: string
+  analyzed_at: string
   files: Array<{
     name: string
     kind: string
@@ -197,9 +242,19 @@ export function fetchSummary(): Promise<ApiSummary> {
   return request<ApiSummary>('/summary')
 }
 
-export function fetchGraph(params: { limit?: number } = {}): Promise<ApiGraphResponse> {
+export function fetchGraph(params: {
+  limit?: number
+  view?: 'auto' | 'full' | 'clusters'
+  clusterId?: number
+  gid?: string
+  depth?: number
+} = {}): Promise<ApiGraphResponse> {
   const qs = new URLSearchParams()
   qs.set('limit', String(params.limit ?? 4000))
+  if (params.view) qs.set('view', params.view)
+  if (params.clusterId !== undefined) qs.set('cluster_id', String(params.clusterId))
+  if (params.gid) qs.set('gid', params.gid)
+  if (params.depth) qs.set('depth', String(params.depth))
   return request<ApiGraphResponse>(`/graph?${qs.toString()}`)
 }
 
@@ -212,25 +267,56 @@ export function fetchTopNodes(): Promise<ApiTopNode[]> {
 }
 
 export function fetchNodeDetail(gid: string): Promise<ApiNodeDetail> {
-  return request<ApiNodeDetail>(`/nodes/${gid}`)
+  return request<ApiNodeDetail>(`/nodes/${encodeURIComponent(gid)}`)
 }
 
 export function fetchAiStatus(): Promise<ApiAiStatus> {
   return request<ApiAiStatus>('/ai/status')
 }
 
-export function askAi(question: string): Promise<ApiAiAskResponse> {
+export function askAi(
+  question: string,
+  language: 'ru' | 'kk',
+  selectedGid?: string | null,
+  clusterId?: number | null,
+): Promise<ApiAiAskResponse> {
   return request<ApiAiAskResponse>('/ai/ask', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ question }),
+    body: JSON.stringify({
+      question,
+      language,
+      selected_gid: selectedGid || null,
+      cluster_id: clusterId ?? null,
+    }),
   })
 }
 
-export async function uploadAnalysis(files: File[]): Promise<AnalysisResponse> {
+export async function uploadAnalysis(files: {
+  nodes: File
+  edges: File
+  transactions: File
+}): Promise<AnalysisResponse> {
   const form = new FormData()
-  files.forEach((file) => form.append('files', file))
+  form.append('nodes', files.nodes)
+  form.append('edges', files.edges)
+  form.append('transactions', files.transactions)
   return request<AnalysisResponse>('/analyses', { method: 'POST', body: form }, false)
+}
+
+export function fetchAnalysis(analysisId: string): Promise<AnalysisResponse> {
+  return request<AnalysisResponse>(`/analyses/${encodeURIComponent(analysisId)}`, undefined, false)
+}
+
+export async function deleteAnalysis(analysisId: string): Promise<void> {
+  const response = await fetch(`/api/analyses/${encodeURIComponent(analysisId)}`, {
+    method: 'DELETE',
+  })
+  if (!response.ok) {
+    let detail = response.statusText
+    try { detail = (await response.json()).detail ?? detail } catch { /* keep status */ }
+    throw new ApiError(response.status, detail)
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -238,17 +324,17 @@ export async function uploadAnalysis(files: File[]): Promise<AnalysisResponse> {
 // ---------------------------------------------------------------------------
 
 function nodeName(n: ApiGraphNode): string {
-  const label = roleLabels[n.role] ?? n.role
+  const label = roleLabels[n.role as Role] ?? n.role
   return n.is_seed ? `Seed · ${label}` : label
 }
 
 export function toGraphNodes(nodes: ApiGraphNode[]): GraphNode[] {
-  return nodes.map((n) => {
+  return nodes.filter((n) => n.kind === 'entity').map((n) => {
     const score = scoreFromPriority(n.priority_score)
     return {
       gid: n.id,
       name: nodeName(n),
-      role: n.role,
+      role: n.role as Role,
       cluster: `Cluster ${n.cluster_id}`,
       risk: riskFromScore(score),
       score,

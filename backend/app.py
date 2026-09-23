@@ -20,7 +20,6 @@ from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
 from .config import get_settings
-from .data_store import get_store
 from .routers import ai, clusters, graph, nodes, uploads
 
 logger = logging.getLogger("moneygraph.backend")
@@ -51,26 +50,16 @@ app.include_router(uploads.router, prefix="/api")
 
 @app.get("/api/health")
 def health() -> dict:
-    """Быстрая проверка живости + подсказка, если out/ ещё не сгенерирован."""
-    missing = get_store().missing_files()
     return {
-        "status": "ok" if not missing else "outputs_missing",
-        "missing_files": missing,
-        "hint": None if not missing else "Сначала запустите ./run.sh, чтобы сгенерировать out/*.",
+        "status": "ok",
+        "mode": "user_analysis_only",
+        "hint": "Загрузите nodes, edges и transactions через POST /api/analyses.",
     }
 
 
 @app.on_event("startup")
 def on_startup() -> None:
-    missing = get_store().missing_files()
-    if missing:
-        logger.warning(
-            "Не найдены выгрузки пайплайна: %s (папка %s). "
-            "API вернёт 503 до тех пор, пока вы не запустите ./run.sh.",
-            ", ".join(missing), settings.out_dir,
-        )
-    else:
-        logger.info("Выгрузки пайплайна найдены в %s — сервер готов.", settings.out_dir)
+    logger.info("Сервер готов: аналитические API требуют active analysis_id.")
 
     if not settings.ai_api_key:
         logger.info(

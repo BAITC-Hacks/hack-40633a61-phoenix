@@ -7,7 +7,9 @@ from fastapi import HTTPException, Query
 from .data_store import Dataset, OutputsNotReadyError, get_store
 
 
-def get_dataset(analysis_id: str | None = Query(default=None)) -> Dataset:
+def get_dataset(
+    analysis_id: str = Query(..., min_length=32, max_length=32),
+) -> Dataset:
     """FastAPI dependency: актуальный :class:`Dataset` или понятная 503-ошибка."""
     try:
         return get_store().get(analysis_id)

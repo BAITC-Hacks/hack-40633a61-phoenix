@@ -40,9 +40,10 @@ def build_top_nodes(df: pd.DataFrame, n: int = 40) -> pd.DataFrame:
     rows = []
     for i, r in top.iterrows():
         why = (
-            f"{r.role} (score {r.role_score:.2f}), priority {r.priority_score:.2f}. "
-            f"{r.evidence}"
-        )[:240]
+            f"{r.role} (score {r.role_score:.2f}), priority {r.priority_score:.2f}, "
+            f"AML risk {r.risk_score:.1f}/100. {r.risk_factors}. {r.evidence}"
+        )[:400]
         rows.append(dict(rank=i + 1, gid=int(r.gid), role=r.role,
-                          priority_score=r.priority_score, why=why))
+                          priority_score=r.priority_score, risk_score=r.risk_score,
+                          risk_level=r.risk_level, why=why))
     return pd.DataFrame(rows)

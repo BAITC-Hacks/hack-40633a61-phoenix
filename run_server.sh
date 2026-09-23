@@ -17,17 +17,12 @@ fi
 source .venv/bin/activate
 pip install -q -r requirements.txt
 
-if [ ! -f "out/nodes_roles.csv" ] || [ ! -f "out/graph_export.json" ]; then
-  echo "Генерирую demo-анализ из data/…"
-  python -m src.moneygraph.cli --data data --out out --no-viewer
-fi
-
 echo "Собираю frontend…"
 (cd frontend && npm ci --silent && npm run build)
 
 echo ""
 echo "Дашборд: http://${HOST}:${PORT}"
-echo "API:     http://${HOST}:${PORT}/api/summary"
+echo "Health:  http://${HOST}:${PORT}/api/health"
 echo ""
 
 exec uvicorn backend.app:app --host "$HOST" --port "$PORT"

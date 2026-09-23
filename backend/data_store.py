@@ -20,7 +20,13 @@ import pandas as pd
 
 from .config import get_settings
 
-REQUIRED_OUT_FILES = ("nodes_roles.csv", "clusters.csv", "top_nodes.csv", "graph_export.json")
+REQUIRED_OUT_FILES = (
+    "nodes_roles.csv",
+    "clusters.csv",
+    "top_nodes.csv",
+    "graph_export.json",
+    "transactions_enriched.parquet",
+)
 
 
 class OutputsNotReadyError(RuntimeError):
@@ -38,6 +44,27 @@ class Dataset:
     analysis_notes: str
     generated_at: float
     out_dir: Path
+    raw_nodes: pd.DataFrame
+    transactions: pd.DataFrame
+    external_to_internal: dict[str, int]
+    internal_to_external: dict[int, str]
+
+    def external_id(self, value: int | str) -> str:
+        try:
+            internal = int(value)
+        except (TypeError, ValueError):
+            return str(value)
+        return self.internal_to_external.get(internal, str(value))
+
+    def internal_id(self, value: str | int) -> int | None:
+        text = str(value)
+        if text in self.external_to_internal:
+            return self.external_to_internal[text]
+        try:
+            numeric = int(text)
+        except ValueError:
+            return None
+        return numeric if numeric in set(self.nodes.gid.astype(int)) else None
 
 
 class DataStore:
@@ -51,7 +78,7 @@ class DataStore:
 
     def _resolve(self, analysis_id: str | None = None) -> Path:
         if analysis_id is None:
-            return self._out_dir
+            raise OutputsNotReadyError("Активный анализ не выбран. Загрузите три parquet-файла.")
         if not analysis_id.isalnum() or len(analysis_id) != 32 or self._runs_dir is None:
             raise OutputsNotReadyError(f"Анализ {analysis_id!r} не найден.")
         out_dir = self._runs_dir / analysis_id / "out"
@@ -83,7 +110,7 @@ class DataStore:
             )
 
         mtime = self._latest_mtime(out_dir)
-        cache_id = analysis_id or "demo"
+        cache_id = analysis_id
         with self._lock:
             cached = self._cache.get(cache_id)
             if cached is not None and cached[0] == mtime:
@@ -96,13 +123,41 @@ class DataStore:
                 graph = json.load(f)
             notes_path = out_dir / "analysis_notes.md"
             notes = notes_path.read_text(encoding="utf-8") if notes_path.exists() else ""
+            run_dir = out_dir.parent
+            raw_nodes = pd.read_parquet(run_dir / "data" / "nodes.parquet")
+            transactions = pd.read_parquet(out_dir / "transactions_enriched.parquet")
+            mapping_path = run_dir / "data" / "id_mapping.json"
+            mapping_payload = json.loads(mapping_path.read_text(encoding="utf-8"))
+            if "external_to_internal" in mapping_payload:
+                external_to_internal = {
+                    str(key): int(value)
+                    for key, value in mapping_payload["external_to_internal"].items()
+                }
+                internal_to_external = {
+                    int(key): str(value)
+                    for key, value in mapping_payload["internal_to_external"].items()
+                }
+            else:
+                external_to_internal = {
+                    str(key): int(value) for key, value in mapping_payload.items()
+                }
+                internal_to_external = {
+                    int(value): str(key) for key, value in external_to_internal.items()
+                }
 
             dataset = Dataset(
                 nodes=nodes, clusters=clusters, top_nodes=top_nodes,
                 graph=graph, analysis_notes=notes, generated_at=mtime, out_dir=out_dir,
+                raw_nodes=raw_nodes, transactions=transactions,
+                external_to_internal=external_to_internal,
+                internal_to_external=internal_to_external,
             )
             self._cache[cache_id] = (mtime, dataset)
             return dataset
+
+    def invalidate(self, analysis_id: str) -> None:
+        with self._lock:
+            self._cache.pop(analysis_id, None)
 
 
 _store: DataStore | None = None

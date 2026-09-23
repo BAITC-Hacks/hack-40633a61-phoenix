@@ -1,94 +1,151 @@
-// Единая точка загрузки живых данных с backend + React Context, чтобы
-// компоненты App.tsx (Overview/NetworkPage/PriorityPage/ClustersPage/
-// InvestigationPage/Graph) могли читать nodes/transfers/clusters/cases так
-// же, как раньше читали статические массивы из data.ts — минимальная правка
-// самого App.tsx, вся загрузка/трансформация вынесена сюда.
 import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from 'react'
 import {
-  ApiError,
+  deleteAnalysis,
+  fetchAnalysis,
   fetchClusters,
   fetchGraph,
   fetchSummary,
   fetchTopNodes,
-  toCaseFiles,
-  toClusters,
-  toGraphNodes,
-  toSummary,
-  toTransfers,
   setActiveAnalysisId,
+  type AnalysisResponse,
+  type ApiCluster,
+  type ApiGraphResponse,
+  type ApiSummary,
+  type ApiTopNode,
 } from './api'
-import type { CaseFile, Cluster, GraphNode, Summary, Transfer } from './data'
 
 interface GraphDataState {
-  nodes: GraphNode[]
-  transfers: Transfer[]
-  clusters: Cluster[]
-  cases: CaseFile[]
-  summary: Summary | null
+  analysisId: string | null
+  analysis: AnalysisResponse | null
+  summary: ApiSummary | null
+  graph: ApiGraphResponse | null
+  clusters: ApiCluster[]
+  topNodes: ApiTopNode[]
   loading: boolean
+  graphLoading: boolean
   error: string | null
   reload: () => void
-  analysisId: string | null
-  selectAnalysis: (analysisId: string | null) => void
+  activateAnalysis: (analysis: AnalysisResponse) => void
+  resetAnalysis: () => Promise<void>
+  openCluster: (clusterId: number) => Promise<void>
+  searchNode: (gid: string) => Promise<boolean>
+  resetGraph: () => Promise<void>
 }
 
 const DataContext = createContext<GraphDataState | null>(null)
 
 export function DataProvider({ children }: { children: ReactNode }) {
-  const [nodes, setNodes] = useState<GraphNode[]>([])
-  const [transfers, setTransfers] = useState<Transfer[]>([])
-  const [clusters, setClusters] = useState<Cluster[]>([])
-  const [cases, setCases] = useState<CaseFile[]>([])
-  const [summary, setSummary] = useState<Summary | null>(null)
-  const [loading, setLoading] = useState(true)
+  const [analysisId, setAnalysisId] = useState<string | null>(
+    () => sessionStorage.getItem('moneygraph.analysisId'),
+  )
+  const [analysis, setAnalysis] = useState<AnalysisResponse | null>(null)
+  const [summary, setSummary] = useState<ApiSummary | null>(null)
+  const [graph, setGraph] = useState<ApiGraphResponse | null>(null)
+  const [clusters, setClusters] = useState<ApiCluster[]>([])
+  const [topNodes, setTopNodes] = useState<ApiTopNode[]>([])
+  const [loading, setLoading] = useState(Boolean(analysisId))
+  const [graphLoading, setGraphLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [reloadKey, setReloadKey] = useState(0)
-  const [analysisId, setAnalysisId] = useState<string | null>(null)
 
   useEffect(() => {
     let cancelled = false
+    if (!analysisId) {
+      setActiveAnalysisId(null)
+      setAnalysis(null)
+      setSummary(null)
+      setGraph(null)
+      setClusters([])
+      setTopNodes([])
+      setError(null)
+      setLoading(false)
+      return
+    }
+    setActiveAnalysisId(analysisId)
     setLoading(true)
     setError(null)
-
-    // Keep the interactive canvas readable; summary/cluster/top endpoints
-    // still represent the complete analysis.
-    Promise.all([fetchSummary(), fetchGraph({ limit: 600 }), fetchClusters(), fetchTopNodes()])
-      .then(([apiSummary, graph, apiClusters, apiTop]) => {
+    Promise.all([
+      fetchAnalysis(analysisId),
+      fetchSummary(),
+      fetchGraph({ view: 'auto', limit: 4000 }),
+      fetchClusters(),
+      fetchTopNodes(),
+    ])
+      .then(([metadata, apiSummary, apiGraph, apiClusters, apiTop]) => {
         if (cancelled) return
-        setNodes(toGraphNodes(graph.nodes))
-        setTransfers(toTransfers(graph.edges))
-        setClusters(toClusters(apiClusters))
-        setCases(toCaseFiles(apiTop, graph.nodes, apiSummary.generated_at))
-        setSummary(toSummary(apiSummary))
+        setAnalysis(metadata)
+        setSummary(apiSummary)
+        setGraph(apiGraph)
+        setClusters(apiClusters)
+        setTopNodes(apiTop)
         setLoading(false)
       })
       .catch((err: unknown) => {
         if (cancelled) return
-        if (err instanceof ApiError && err.status === 503) {
-          // out/*.csv ещё не сгенерированы (./run.sh не запускался) —
-          // понятное сообщение вместо падения страницы.
-          setError('Аналитика ещё не сгенерирована на backend: запустите ./run.sh, затем обновите страницу.')
-        } else {
-          setError(err instanceof Error ? err.message : 'Не удалось загрузить данные с backend.')
-        }
+        setError(err instanceof Error ? err.message : 'Не удалось загрузить данные с backend.')
         setLoading(false)
       })
-
-    return () => {
-      cancelled = true
-    }
-  }, [reloadKey])
+    return () => { cancelled = true }
+  }, [analysisId, reloadKey])
 
   const reload = useCallback(() => setReloadKey((k) => k + 1), [])
-  const selectAnalysis = useCallback((value: string | null) => {
-    setActiveAnalysisId(value)
-    setAnalysisId(value)
+  const activateAnalysis = useCallback((value: AnalysisResponse) => {
+    sessionStorage.setItem('moneygraph.analysisId', value.analysis_id)
+    setActiveAnalysisId(value.analysis_id)
+    setAnalysis(value)
+    setAnalysisId(value.analysis_id)
     setReloadKey((k) => k + 1)
   }, [])
+  const resetAnalysis = useCallback(async () => {
+    if (analysisId) await deleteAnalysis(analysisId)
+    sessionStorage.removeItem('moneygraph.analysisId')
+    setActiveAnalysisId(null)
+    setAnalysisId(null)
+  }, [analysisId])
+
+  const replaceGraph = useCallback(async (request: () => Promise<ApiGraphResponse>) => {
+    setGraphLoading(true)
+    try {
+      setGraph(await request())
+      setError(null)
+    } finally {
+      setGraphLoading(false)
+    }
+  }, [])
+  const openCluster = useCallback(
+    async (clusterId: number) => replaceGraph(
+      () => fetchGraph({ clusterId, view: 'full', limit: 4000 }),
+    ),
+    [replaceGraph],
+  )
+  const searchNode = useCallback(async (gid: string) => {
+    try {
+      await replaceGraph(async () => {
+        const response = await fetchGraph({ gid, depth: 1, view: 'full', limit: 4000 })
+        if (!response.nodes.some((node) => node.id === gid)) throw new Error('not-found')
+        return response
+      })
+      return true
+    } catch {
+      return false
+    }
+  }, [replaceGraph])
+  const resetGraph = useCallback(
+    async () => replaceGraph(() => fetchGraph({ view: 'auto', limit: 4000 })),
+    [replaceGraph],
+  )
 
   const value = useMemo<GraphDataState>(
-    () => ({ nodes, transfers, clusters, cases, summary, loading, error, reload, analysisId, selectAnalysis }),
-    [nodes, transfers, clusters, cases, summary, loading, error, reload, analysisId, selectAnalysis],
+    () => ({
+      analysisId, analysis, summary, graph, clusters, topNodes, loading,
+      graphLoading, error, reload, activateAnalysis, resetAnalysis,
+      openCluster, searchNode, resetGraph,
+    }),
+    [
+      analysisId, analysis, summary, graph, clusters, topNodes, loading,
+      graphLoading, error, reload, activateAnalysis, resetAnalysis,
+      openCluster, searchNode, resetGraph,
+    ],
   )
 
   return <DataContext.Provider value={value}>{children}</DataContext.Provider>

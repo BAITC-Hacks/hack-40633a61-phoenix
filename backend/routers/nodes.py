@@ -9,7 +9,13 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 
 from ..data_store import Dataset
 from ..deps import get_dataset
-from ..schemas import NeighborEdge, NodeDetail, NodeListItem, NodeListResponse
+from ..schemas import (
+    NeighborEdge,
+    NodeDetail,
+    NodeListItem,
+    NodeListResponse,
+    TransactionOut,
+)
 
 router = APIRouter(prefix="/nodes", tags=["nodes"])
 
@@ -57,10 +63,11 @@ def list_nodes(
 
     items = [
         NodeListItem(
-            gid=str(r.gid), role=r.role, role_score=float(r.role_score),
+            gid=ds.external_id(r.gid), role=r.role, role_score=float(r.role_score),
             cluster_id=int(r.cluster_id), priority_score=float(r.priority_score),
             is_seed=bool(r.is_seed), in_deg=int(r.in_deg), out_deg=int(r.out_deg),
             in_kzt=float(r.in_kzt), out_kzt=float(r.out_kzt),
+            risk_score=float(r.risk_score), risk_level=r.risk_level,
         )
         for r in page_df.itertuples()
     ]
@@ -68,31 +75,76 @@ def list_nodes(
 
 
 @router.get("/{gid}", response_model=NodeDetail)
-def get_node(gid: int, ds: Dataset = Depends(get_dataset)) -> NodeDetail:
-    row = ds.nodes[ds.nodes.gid == gid]
+def get_node(gid: str, ds: Dataset = Depends(get_dataset)) -> NodeDetail:
+    internal_gid = ds.internal_id(gid)
+    if internal_gid is None:
+        raise HTTPException(status_code=404, detail=f"ID {gid} не найден в активном анализе.")
+    row = ds.nodes[ds.nodes.gid == internal_gid]
     if row.empty:
-        raise HTTPException(status_code=404, detail=f"gid {gid} не найден в nodes_roles.csv")
+        raise HTTPException(status_code=404, detail=f"ID {gid} не найден в активном анализе.")
     r = row.iloc[0].to_dict()
 
     role_by_id = {n["id"]: n["role"] for n in ds.graph["nodes"]}
     neighbors: list[NeighborEdge] = []
     for e in ds.graph["edges"]:
-        if e["source"] == gid:
+        if e["source"] == internal_gid:
             neighbors.append(NeighborEdge(
-                gid=str(e["target"]), role=role_by_id.get(e["target"], "?"),
+                gid=ds.external_id(e["target"]), role=role_by_id.get(e["target"], "?"),
                 sum_kzt=e["sum_kzt"], n_tx=e["n_tx"], direction="out",
+                risk_score=e["risk_score"], risk_level=e["risk_level"],
+                has_transactions=e.get("has_transactions", True),
             ))
-        elif e["target"] == gid:
+        elif e["target"] == internal_gid:
             neighbors.append(NeighborEdge(
-                gid=str(e["source"]), role=role_by_id.get(e["source"], "?"),
+                gid=ds.external_id(e["source"]), role=role_by_id.get(e["source"], "?"),
                 sum_kzt=e["sum_kzt"], n_tx=e["n_tx"], direction="in",
+                risk_score=e["risk_score"], risk_level=e["risk_level"],
+                has_transactions=e.get("has_transactions", True),
             ))
     neighbors.sort(key=lambda n: n.sum_kzt, reverse=True)
 
+    raw_row = ds.raw_nodes[ds.raw_nodes.gid == internal_gid]
+    attributes = {}
+    if not raw_row.empty:
+        attributes = {
+            str(key): _json_value(value)
+            for key, value in raw_row.iloc[0].to_dict().items()
+            if key not in {"gid", "depth", "is_seed"} and _json_value(value) is not None
+        }
+
+    tx_rows = ds.transactions[
+        (ds.transactions.src == internal_gid) | (ds.transactions.dst == internal_gid)
+    ].sort_values(["risk_score", "date"], ascending=[False, False]).head(20)
+    canonical = {
+        "tx_id", "src", "dst", "sum_kzt", "date",
+        "risk_score", "risk_level", "risk_factors",
+    }
+    transactions = []
+    for tx in tx_rows.to_dict("records"):
+        transactions.append(
+            TransactionOut(
+                tx_id=str(tx["tx_id"]),
+                source=ds.external_id(tx["src"]),
+                target=ds.external_id(tx["dst"]),
+                sum_kzt=float(tx["sum_kzt"]),
+                date=str(_json_value(tx["date"])),
+                risk_score=float(tx["risk_score"]),
+                risk_level=str(tx["risk_level"]),
+                risk_factors=str(tx["risk_factors"]),
+                details={
+                    str(key): _json_value(value)
+                    for key, value in tx.items()
+                    if key not in canonical and _json_value(value) is not None
+                },
+            )
+        )
+
     return NodeDetail(
-        gid=str(r["gid"]), role=r["role"], role_score=float(r["role_score"]),
+        gid=ds.external_id(r["gid"]), role=r["role"], role_score=float(r["role_score"]),
         cluster_id=int(r["cluster_id"]), priority_score=float(r["priority_score"]),
         evidence=r.get("evidence", ""), is_seed=bool(r.get("is_seed", False)),
+        risk_score=float(r["risk_score"]), risk_level=r["risk_level"],
+        risk_factors=r["risk_factors"], risk_explanation=r["risk_explanation"],
         depth=int(_clean(r.get("depth")) or 0),
         in_deg=int(r.get("in_deg", 0)), out_deg=int(r.get("out_deg", 0)),
         in_kzt=float(r.get("in_kzt", 0.0)), out_kzt=float(r.get("out_kzt", 0.0)),
@@ -105,5 +157,18 @@ def get_node(gid: int, ds: Dataset = Depends(get_dataset)) -> NodeDetail:
         max_same_day_payers=_clean(r.get("max_same_day_payers")),
         fast_transit=_clean(r.get("fast_transit")),
         synchronized_burst=_clean(r.get("synchronized_burst")),
+        attributes=attributes,
         neighbors=neighbors[:50],
+        transactions=transactions,
     )
+
+
+def _json_value(value):
+    cleaned = _clean(value)
+    if cleaned is None:
+        return None
+    if hasattr(cleaned, "isoformat"):
+        return cleaned.isoformat()
+    if isinstance(cleaned, (str, int, float, bool)):
+        return cleaned
+    return str(cleaned)

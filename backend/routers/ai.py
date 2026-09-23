@@ -14,7 +14,7 @@ router = APIRouter(prefix="/ai", tags=["ai"])
 
 
 @router.get("/status")
-def ai_status() -> dict:
+def ai_status(_ds: Dataset = Depends(get_dataset)) -> dict:
     """Настроен ли AI-ассистент — фронтенд использует это, чтобы не спамить
     пользователя ошибками, а сразу показать корректное состояние в Investigation."""
     settings = get_settings()
@@ -30,7 +30,13 @@ async def ask(payload: AIAskRequest, ds: Dataset = Depends(get_dataset)) -> AIAs
     """Отвечает на вопрос аналитика. 503, если AI_API_KEY не настроен —
     остальной дашборд при этом продолжает работать без интернета/ключа."""
     try:
-        result = await ai_assistant.ask(payload.question, ds)
+        result = await ai_assistant.ask(
+            payload.question,
+            ds,
+            language=payload.language,
+            selected_gid=payload.selected_gid,
+            cluster_id=payload.cluster_id,
+        )
     except ai_assistant.AIAssistantNotConfiguredError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except ai_assistant.AIAssistantUpstreamError as exc:
